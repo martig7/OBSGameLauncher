@@ -1,0 +1,548 @@
+"""
+Game Manager GUI
+Tkinter application to manage games and control the watcher.
+Recording organization is handled automatically by the watcher.
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import ctypes
+import ctypes.wintypes as wintypes
+import json
+import os
+import subprocess
+import time
+from configparser import ConfigParser
+from PIL import Image, ImageTk
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "games_config.json")
+STATE_FILE = os.path.join(SCRIPT_DIR, "game_state")
+PID_FILE = os.path.join(SCRIPT_DIR, "watcher.pid")
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, "manager_settings.json")
+
+# Windows API
+TH32CS_SNAPPROCESS = 0x00000002
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('cntUsage', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+        ('th32ModuleID', wintypes.DWORD),
+        ('cntThreads', wintypes.DWORD),
+        ('th32ParentProcessID', wintypes.DWORD),
+        ('pcPriClassBase', ctypes.c_long),
+        ('dwFlags', wintypes.DWORD),
+        ('szExeFile', wintypes.WCHAR * 260),
+    ]
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+EnumWindows = user32.EnumWindows
+EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+GetWindowTextW = user32.GetWindowTextW
+GetWindowTextLengthW = user32.GetWindowTextLengthW
+IsWindowVisible = user32.IsWindowVisible
+GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+Process32FirstW = kernel32.Process32FirstW
+Process32NextW = kernel32.Process32NextW
+CloseHandle = kernel32.CloseHandle
+
+
+# ============== Config Functions ==============
+
+def load_config():
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {"games": []}
+
+
+def save_config(config):
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+
+
+def load_settings():
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {
+        "organized_path": "",
+        "auto_organize": True
+    }
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+        return False
+
+
+def get_obs_recording_path():
+    """Find OBS recording path from OBS configuration."""
+    appdata = os.getenv('APPDATA', '')
+    profiles_dir = os.path.join(appdata, 'obs-studio', 'basic', 'profiles')
+
+    if os.path.exists(profiles_dir):
+        for profile in os.listdir(profiles_dir):
+            basic_ini = os.path.join(profiles_dir, profile, 'basic.ini')
+            if os.path.exists(basic_ini):
+                try:
+                    config = ConfigParser()
+                    config.read(basic_ini, encoding='utf-8-sig')
+                    for section in ['SimpleOutput', 'AdvOut']:
+                        if config.has_section(section):
+                            for key in ['filepath', 'recfilepath']:
+                                if config.has_option(section, key):
+                                    path = config.get(section, key)
+                                    if path and os.path.exists(path):
+                                        return path
+                except:
+                    continue
+
+    # Fallback
+    user_profile = os.getenv('USERPROFILE', '')
+    for path in [os.path.join(user_profile, 'Videos'), os.path.join(user_profile, 'Videos', 'OBS')]:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# ============== Windows API Functions ==============
+
+def get_visible_windows():
+    windows = []
+
+    def callback(hwnd, lparam):
+        if IsWindowVisible(hwnd):
+            length = GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                GetWindowTextW(hwnd, buffer, length + 1)
+                if buffer.value:
+                    pid = wintypes.DWORD()
+                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    windows.append({'title': buffer.value, 'pid': pid.value})
+        return True
+
+    EnumWindows(EnumWindowsProc(callback), 0)
+    return windows
+
+
+def get_process_list():
+    processes = {}
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == -1:
+        return processes
+
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                processes[entry.th32ProcessID] = entry.szExeFile
+                if not Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        CloseHandle(snapshot)
+    return processes
+
+
+def is_watcher_running():
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True, pid
+        except:
+            pass
+    return False, None
+
+
+def get_watcher_state():
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return f.read().strip()
+    except:
+        return None
+
+
+# ============== Main Application ==============
+
+class GameManagerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Game Auto-Recorder Manager")
+        self.root.geometry("550x600")
+        self.root.resizable(True, True)
+
+        self.settings = load_settings()
+        self.obs_recording_path = get_obs_recording_path()
+        self.game_icons = {}  # Cache for loaded icons
+
+        # Create notebook (tabs)
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Create tabs
+        self.create_main_tab()
+        self.create_settings_tab()
+
+        # Initial load
+        self.refresh_games()
+
+        # Auto-refresh
+        self.auto_refresh()
+
+    def create_main_tab(self):
+        """Main tab with watcher control and games list."""
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="Games")
+
+        # === Status Section ===
+        status_frame = ttk.LabelFrame(tab, text="Status", padding=10)
+        status_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.watcher_status = ttk.Label(status_frame, text="Watcher: Unknown")
+        self.watcher_status.pack(anchor=tk.W)
+
+        self.state_label = ttk.Label(status_frame, text="State: Unknown")
+        self.state_label.pack(anchor=tk.W)
+
+        btn_frame = ttk.Frame(status_frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.start_btn = ttk.Button(btn_frame, text="Start Watcher", command=self.start_watcher)
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.stop_btn = ttk.Button(btn_frame, text="Stop Watcher", command=self.stop_watcher)
+        self.stop_btn.pack(side=tk.LEFT)
+
+        # === Games Section ===
+        games_frame = ttk.LabelFrame(tab, text="Games", padding=10)
+        games_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        list_frame = ttk.Frame(games_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Treeview with icon and text columns
+        self.games_list = ttk.Treeview(list_frame, columns=('name', 'selector', 'status'),
+                                        show='tree', yscrollcommand=scrollbar.set, selectmode='browse')
+        self.games_list.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.games_list.yview)
+
+        # Configure column widths
+        self.games_list.column('#0', width=300, stretch=True)
+
+        game_btn_frame = ttk.Frame(games_frame)
+        game_btn_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(game_btn_frame, text="Remove", command=self.remove_game).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(game_btn_frame, text="Toggle", command=self.toggle_game).pack(side=tk.LEFT)
+
+        # === Add Game Section ===
+        add_frame = ttk.LabelFrame(tab, text="Add New Game", padding=10)
+        add_frame.pack(fill=tk.X)
+
+        name_frame = ttk.Frame(add_frame)
+        name_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(name_frame, text="Name:", width=10).pack(side=tk.LEFT)
+        self.name_entry = ttk.Entry(name_frame)
+        self.name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        selector_frame = ttk.Frame(add_frame)
+        selector_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(selector_frame, text="Selector:", width=10).pack(side=tk.LEFT)
+        self.selector_var = tk.StringVar()
+        self.selector_combo = ttk.Combobox(selector_frame, textvariable=self.selector_var)
+        self.selector_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        add_btn_frame = ttk.Frame(add_frame)
+        add_btn_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(add_btn_frame, text="Refresh Windows", command=self.refresh_windows).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(add_btn_frame, text="Add Game", command=self.add_game).pack(side=tk.LEFT)
+
+        self.refresh_windows()
+
+    def create_settings_tab(self):
+        """Settings tab for auto-organization configuration."""
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="Settings")
+
+        # === OBS Detection ===
+        obs_frame = ttk.LabelFrame(tab, text="OBS Recording Folder (Auto-Detected)", padding=10)
+        obs_frame.pack(fill=tk.X, pady=(0, 10))
+
+        obs_path_display = self.obs_recording_path or "(Not found - is OBS installed?)"
+        self.obs_path_label = ttk.Label(obs_frame, text=obs_path_display, font=('Consolas', 9))
+        self.obs_path_label.pack(anchor=tk.W)
+
+        # === Auto-Organization ===
+        org_frame = ttk.LabelFrame(tab, text="Automatic Recording Organization", padding=10)
+        org_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Enable checkbox
+        self.auto_organize_var = tk.BooleanVar(value=self.settings.get('auto_organize', True))
+        ttk.Checkbutton(org_frame, text="Automatically organize recordings when game closes",
+                       variable=self.auto_organize_var).pack(anchor=tk.W, pady=(0, 10))
+
+        # Organized Path
+        ttk.Label(org_frame, text="Organize recordings into:").pack(anchor=tk.W)
+        path_frame = ttk.Frame(org_frame)
+        path_frame.pack(fill=tk.X, pady=(5, 0))
+
+        # Default to OBS path if no organized_path is set
+        default_path = self.settings.get('organized_path', '') or self.obs_recording_path or ''
+        self.org_path_var = tk.StringVar(value=default_path)
+        self.org_path_entry = ttk.Entry(path_frame, textvariable=self.org_path_var)
+        self.org_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(path_frame, text="Browse", command=self.browse_org_path).pack(side=tk.LEFT, padx=(5, 0))
+
+        ttk.Label(org_frame, text="Game subfolders will be created here automatically",
+                 font=('Segoe UI', 8), foreground='gray').pack(anchor=tk.W, pady=(2, 0))
+
+        # Save button
+        ttk.Button(org_frame, text="Save Settings", command=self.save_settings_click).pack(anchor=tk.W, pady=(10, 0))
+
+        # === Info ===
+        info_frame = ttk.LabelFrame(tab, text="How It Works", padding=10)
+        info_frame.pack(fill=tk.X)
+
+        info_text = """When a game closes and recording stops, files are organized as:
+
+  {Destination}/{Game} - Week of {Mon DD YYYY}/
+    {Game} Session {YYYY-MM-DD} #1.mp4
+    {Game} Session {YYYY-MM-DD} #2.mp4
+
+Example:
+  D:/Videos/OBS-Recordings/Minecraft - Week of Jan 13 2026/
+    Minecraft Session 2026-01-17 #1.mp4"""
+
+        ttk.Label(info_frame, text=info_text, font=('Consolas', 9)).pack(anchor=tk.W)
+
+    def browse_org_path(self):
+        path = filedialog.askdirectory(title="Select Organized Recordings Folder")
+        if path:
+            self.org_path_var.set(path)
+
+    def save_settings_click(self):
+        organized_path = self.org_path_var.get().strip()
+        auto_organize = self.auto_organize_var.get()
+
+        # Validate path exists
+        if organized_path and not os.path.exists(organized_path):
+            if messagebox.askyesno("Create Folder?", f"Folder does not exist:\n{organized_path}\n\nCreate it?"):
+                try:
+                    os.makedirs(organized_path, exist_ok=True)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not create folder:\n{e}")
+                    return
+            else:
+                return
+
+        self.settings['organized_path'] = organized_path
+        self.settings['auto_organize'] = auto_organize
+
+        if save_settings(self.settings):
+            messagebox.showinfo("Settings", f"Settings saved!\n\nOrganized path: {organized_path or '(not set)'}\nAuto-organize: {'Enabled' if auto_organize else 'Disabled'}")
+        else:
+            messagebox.showerror("Error", "Failed to save settings. Check file permissions.")
+
+    def refresh_all(self):
+        self.refresh_status()
+        self.refresh_games()
+
+    def refresh_status(self):
+        running, pid = is_watcher_running()
+        state = get_watcher_state()
+
+        if running:
+            self.watcher_status.config(text=f"Watcher: Running (PID: {pid})", foreground='green')
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+        else:
+            self.watcher_status.config(text="Watcher: Stopped", foreground='red')
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+
+        if state:
+            if state.startswith("RECORDING"):
+                parts = state.split("|")
+                game = parts[1] if len(parts) > 1 else "Unknown"
+                self.state_label.config(text=f"State: Recording {game}", foreground='red')
+            elif state == "IDLE":
+                self.state_label.config(text="State: Idle", foreground='gray')
+            else:
+                self.state_label.config(text=f"State: {state}", foreground='gray')
+        else:
+            self.state_label.config(text="State: No state file", foreground='gray')
+
+    def load_icon(self, icon_path, size=(24, 24)):
+        """Load and resize an icon, returning a PhotoImage."""
+        if not icon_path or not os.path.exists(icon_path):
+            return None
+        try:
+            img = Image.open(icon_path)
+            img = img.resize(size, Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"Error loading icon {icon_path}: {e}")
+            return None
+
+    def refresh_games(self):
+        # Clear existing items
+        for item in self.games_list.get_children():
+            self.games_list.delete(item)
+
+        config = load_config()
+        self.game_icons.clear()  # Clear old icon references
+
+        for i, game in enumerate(config.get("games", [])):
+            status = "✓" if game.get("enabled", True) else "✗"
+            display_text = f"[{status}] {game['name']} ({game['selector']})"
+
+            # Load icon if available
+            icon_path = game.get("icon_path", "")
+            icon = self.load_icon(icon_path)
+
+            if icon:
+                self.game_icons[i] = icon  # Keep reference to prevent garbage collection
+                self.games_list.insert('', 'end', iid=str(i), text=display_text, image=icon)
+            else:
+                self.games_list.insert('', 'end', iid=str(i), text=display_text)
+
+    def refresh_windows(self):
+        windows = get_visible_windows()
+        processes = get_process_list()
+
+        system_procs = ['explorer.exe', 'searchhost.exe', 'textinputhost.exe',
+                       'shellexperiencehost.exe', 'applicationframehost.exe']
+
+        window_list = []
+        for w in windows:
+            proc = processes.get(w['pid'], '').lower()
+            if proc not in system_procs and w['title'].strip():
+                window_list.append(w['title'])
+
+        self.selector_combo['values'] = window_list
+        if window_list:
+            self.selector_combo.set(window_list[0])
+
+    def start_watcher(self):
+        running, _ = is_watcher_running()
+        if running:
+            return
+
+        watcher_path = os.path.join(SCRIPT_DIR, "game_watcher.pyw")
+        subprocess.Popen(["pythonw", watcher_path], creationflags=subprocess.CREATE_NO_WINDOW)
+        time.sleep(0.5)
+        self.refresh_status()
+
+    def stop_watcher(self):
+        running, pid = is_watcher_running()
+        if not running:
+            return
+
+        try:
+            kernel32.TerminateProcess(kernel32.OpenProcess(1, False, pid), 0)
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+            if os.path.exists(STATE_FILE):
+                os.remove(STATE_FILE)
+        except:
+            pass
+
+        self.refresh_status()
+
+    def add_game(self):
+        name = self.name_entry.get().strip()
+        selector = self.selector_var.get().strip()
+
+        if not name or not selector:
+            messagebox.showwarning("Warning", "Please enter name and selector")
+            return
+
+        config = load_config()
+
+        for game in config.get("games", []):
+            if game.get("selector", "").lower() == selector.lower():
+                messagebox.showwarning("Warning", "Game with this selector already exists")
+                return
+
+        config["games"].append({
+            "name": name,
+            "selector": selector,
+            "icon_path": "",
+            "enabled": True
+        })
+        save_config(config)
+
+        self.name_entry.delete(0, tk.END)
+        self.selector_var.set("")
+        self.refresh_games()
+        messagebox.showinfo("Success", f"Added: {name}")
+
+    def remove_game(self):
+        selection = self.games_list.selection()
+        if not selection:
+            return
+
+        index = int(selection[0])
+        config = load_config()
+        games = config.get("games", [])
+
+        if 0 <= index < len(games):
+            game = games[index]
+            if messagebox.askyesno("Confirm", f"Remove '{game['name']}'?"):
+                games.pop(index)
+                save_config(config)
+                self.refresh_games()
+
+    def toggle_game(self):
+        selection = self.games_list.selection()
+        if not selection:
+            return
+
+        index = int(selection[0])
+        config = load_config()
+        games = config.get("games", [])
+
+        if 0 <= index < len(games):
+            games[index]['enabled'] = not games[index].get('enabled', True)
+            save_config(config)
+            self.refresh_games()
+
+    def auto_refresh(self):
+        self.refresh_status()
+        self.root.after(2000, self.auto_refresh)
+
+
+def main():
+    root = tk.Tk()
+    app = GameManagerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
