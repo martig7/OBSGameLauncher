@@ -12,14 +12,35 @@ import json
 import os
 import subprocess
 import time
+import threading
+import winsound
+from datetime import datetime
 from configparser import ConfigParser
 from PIL import Image, ImageTk
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.join(SCRIPT_DIR, "runtime")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "games_config.json")
-STATE_FILE = os.path.join(SCRIPT_DIR, "game_state")
-PID_FILE = os.path.join(SCRIPT_DIR, "watcher.pid")
+STATE_FILE = os.path.join(RUNTIME_DIR, "game_state")
+PID_FILE = os.path.join(RUNTIME_DIR, "watcher.pid")
 SETTINGS_FILE = os.path.join(SCRIPT_DIR, "manager_settings.json")
+MARKERS_FILE = os.path.join(RUNTIME_DIR, "clip_markers.json")
+
+# Ensure runtime directory exists
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+# Virtual key codes for hotkeys
+VK_CODES = {
+    'F1': 0x70, 'F2': 0x71, 'F3': 0x72, 'F4': 0x73, 'F5': 0x74,
+    'F6': 0x75, 'F7': 0x76, 'F8': 0x77, 'F9': 0x78, 'F10': 0x79,
+    'F11': 0x7A, 'F12': 0x7B,
+    'INSERT': 0x2D, 'DELETE': 0x2E, 'HOME': 0x24, 'END': 0x23,
+    'PAGEUP': 0x21, 'PAGEDOWN': 0x22,
+    'NUMPAD0': 0x60, 'NUMPAD1': 0x61, 'NUMPAD2': 0x62, 'NUMPAD3': 0x63,
+    'NUMPAD4': 0x64, 'NUMPAD5': 0x65, 'NUMPAD6': 0x66, 'NUMPAD7': 0x67,
+    'NUMPAD8': 0x68, 'NUMPAD9': 0x69,
+}
+VK_TO_NAME = {v: k for k, v in VK_CODES.items()}
 
 # Windows API
 TH32CS_SNAPPROCESS = 0x00000002
@@ -91,6 +112,39 @@ def save_settings(settings):
     except Exception as e:
         print(f"Error saving settings: {e}")
         return False
+
+
+def load_markers():
+    """Load clip markers from file."""
+    try:
+        if os.path.exists(MARKERS_FILE):
+            with open(MARKERS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {"markers": []}
+
+
+def save_markers(markers):
+    """Save clip markers to file."""
+    try:
+        with open(MARKERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(markers, f, indent=2)
+        return True
+    except:
+        return False
+
+
+def add_clip_marker(game_name):
+    """Add a clip marker for the current time."""
+    markers = load_markers()
+    markers["markers"].append({
+        "game_name": game_name,
+        "timestamp": time.time(),
+        "created_at": datetime.now().isoformat()
+    })
+    save_markers(markers)
+    return True
 
 
 def get_obs_recording_path():
@@ -191,12 +245,22 @@ class GameManagerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Game Auto-Recorder Manager")
-        self.root.geometry("550x600")
+        self.root.geometry("600x700")
+        self.root.minsize(550, 650)
         self.root.resizable(True, True)
 
         self.settings = load_settings()
         self.obs_recording_path = get_obs_recording_path()
         self.game_icons = {}  # Cache for loaded icons
+        self.viewer_process = None  # Track recordings viewer subprocess
+        self.hotkey_listener_running = False
+        self.current_recording_game = None  # Track which game is being recorded
+
+        # Handle window close to clean up subprocesses
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Start hotkey listener if configured
+        self.start_hotkey_listener()
 
         # Create notebook (tabs)
         self.notebook = ttk.Notebook(root)
@@ -236,6 +300,8 @@ class GameManagerApp:
         self.stop_btn = ttk.Button(btn_frame, text="Stop Watcher", command=self.stop_watcher)
         self.stop_btn.pack(side=tk.LEFT)
 
+        ttk.Button(btn_frame, text="View Recordings", command=self.open_recordings_viewer).pack(side=tk.RIGHT)
+
         # === Games Section ===
         games_frame = ttk.LabelFrame(tab, text="Games", padding=10)
         games_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -252,14 +318,15 @@ class GameManagerApp:
         self.games_list.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.games_list.yview)
 
-        # Configure column widths
-        self.games_list.column('#0', width=300, stretch=True)
+        # Configure column widths - wider to show full icons
+        self.games_list.column('#0', width=400, minwidth=350, stretch=True)
 
         game_btn_frame = ttk.Frame(games_frame)
         game_btn_frame.pack(fill=tk.X, pady=(10, 0))
 
         ttk.Button(game_btn_frame, text="Remove", command=self.remove_game).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(game_btn_frame, text="Toggle", command=self.toggle_game).pack(side=tk.LEFT)
+        ttk.Button(game_btn_frame, text="Toggle", command=self.toggle_game).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(game_btn_frame, text="Edit Scene", command=self.edit_scene).pack(side=tk.LEFT)
 
         # === Add Game Section ===
         add_frame = ttk.LabelFrame(tab, text="Add New Game", padding=10)
@@ -277,6 +344,13 @@ class GameManagerApp:
         self.selector_var = tk.StringVar()
         self.selector_combo = ttk.Combobox(selector_frame, textvariable=self.selector_var)
         self.selector_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        scene_frame = ttk.Frame(add_frame)
+        scene_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(scene_frame, text="Scene:", width=10).pack(side=tk.LEFT)
+        self.scene_entry = ttk.Entry(scene_frame)
+        self.scene_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(scene_frame, text="(optional)", font=('Segoe UI', 8), foreground='gray').pack(side=tk.LEFT, padx=(5, 0))
 
         add_btn_frame = ttk.Frame(add_frame)
         add_btn_frame.pack(fill=tk.X, pady=(5, 0))
@@ -324,6 +398,40 @@ class GameManagerApp:
 
         # Save button
         ttk.Button(org_frame, text="Save Settings", command=self.save_settings_click).pack(anchor=tk.W, pady=(10, 0))
+
+        # === Clip Marker Hotkey ===
+        hotkey_frame = ttk.LabelFrame(tab, text="Clip Marker Hotkey", padding=10)
+        hotkey_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(hotkey_frame, text="Press this key while recording to mark a moment for clipping:").pack(anchor=tk.W)
+
+        hotkey_select_frame = ttk.Frame(hotkey_frame)
+        hotkey_select_frame.pack(fill=tk.X, pady=(5, 0))
+
+        self.hotkey_var = tk.StringVar(value=self.settings.get('clip_hotkey', 'F9'))
+        hotkey_options = list(VK_CODES.keys())
+        self.hotkey_combo = ttk.Combobox(hotkey_select_frame, textvariable=self.hotkey_var,
+                                         values=hotkey_options, state='readonly', width=15)
+        self.hotkey_combo.pack(side=tk.LEFT)
+
+        ttk.Button(hotkey_select_frame, text="Save Hotkey", command=self.save_hotkey).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.hotkey_status_label = ttk.Label(hotkey_frame, text="", font=('Segoe UI', 8))
+        self.hotkey_status_label.pack(anchor=tk.W, pady=(5, 0))
+        self.update_hotkey_status()
+
+        # Show notification checkbox
+        self.show_marker_notification_var = tk.BooleanVar(value=self.settings.get('show_marker_notification', True))
+        ttk.Checkbutton(hotkey_frame, text="Show notification when marker is added (may not work in fullscreen games)",
+                       variable=self.show_marker_notification_var, command=self.save_notification_setting).pack(anchor=tk.W, pady=(5, 0))
+
+        # Play sound checkbox
+        self.play_marker_sound_var = tk.BooleanVar(value=self.settings.get('play_marker_sound', True))
+        ttk.Checkbutton(hotkey_frame, text="Play sound when marker is added",
+                       variable=self.play_marker_sound_var, command=self.save_notification_setting).pack(anchor=tk.W, pady=(2, 0))
+
+        ttk.Label(hotkey_frame, text="Markers will appear as pins on the video timeline in the recordings viewer",
+                 font=('Segoe UI', 8), foreground='gray').pack(anchor=tk.W, pady=(2, 0))
 
         # === Info ===
         info_frame = ttk.LabelFrame(tab, text="How It Works", padding=10)
@@ -420,7 +528,9 @@ Example:
 
         for i, game in enumerate(config.get("games", [])):
             status = "✓" if game.get("enabled", True) else "✗"
-            display_text = f"[{status}] {game['name']} ({game['selector']})"
+            scene = game.get("scene", "")
+            scene_info = f" [Scene: {scene}]" if scene else ""
+            display_text = f"[{status}] {game['name']} ({game['selector']}){scene_info}"
 
             # Load icon if available
             icon_path = game.get("icon_path", "")
@@ -478,6 +588,7 @@ Example:
     def add_game(self):
         name = self.name_entry.get().strip()
         selector = self.selector_var.get().strip()
+        scene = self.scene_entry.get().strip()
 
         if not name or not selector:
             messagebox.showwarning("Warning", "Please enter name and selector")
@@ -494,12 +605,14 @@ Example:
             "name": name,
             "selector": selector,
             "icon_path": "",
+            "scene": scene,
             "enabled": True
         })
         save_config(config)
 
         self.name_entry.delete(0, tk.END)
         self.selector_var.set("")
+        self.scene_entry.delete(0, tk.END)
         self.refresh_games()
         messagebox.showinfo("Success", f"Added: {name}")
 
@@ -532,6 +645,213 @@ Example:
             games[index]['enabled'] = not games[index].get('enabled', True)
             save_config(config)
             self.refresh_games()
+
+    def edit_scene(self):
+        selection = self.games_list.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a game first")
+            return
+
+        index = int(selection[0])
+        config = load_config()
+        games = config.get("games", [])
+
+        if 0 <= index < len(games):
+            game = games[index]
+            current_scene = game.get('scene', '')
+
+            # Create a simple dialog to edit the scene
+            dialog = tk.Toplevel(self.root)
+            dialog.title(f"Edit Scene - {game['name']}")
+            dialog.geometry("400x150")
+            dialog.resizable(False, False)
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            # Center the dialog
+            dialog.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() - 400) // 2
+            y = self.root.winfo_y() + (self.root.winfo_height() - 150) // 2
+            dialog.geometry(f"+{x}+{y}")
+
+            frame = ttk.Frame(dialog, padding=15)
+            frame.pack(fill=tk.BOTH, expand=True)
+
+            ttk.Label(frame, text=f"OBS Scene for {game['name']}:").pack(anchor=tk.W)
+            scene_var = tk.StringVar(value=current_scene)
+            scene_entry = ttk.Entry(frame, textvariable=scene_var, width=50)
+            scene_entry.pack(fill=tk.X, pady=(5, 5))
+            scene_entry.focus_set()
+            scene_entry.select_range(0, tk.END)
+
+            ttk.Label(frame, text="Leave empty to use default scene", font=('Segoe UI', 8), foreground='gray').pack(anchor=tk.W)
+
+            def save_scene():
+                games[index]['scene'] = scene_var.get().strip()
+                save_config(config)
+                self.refresh_games()
+                dialog.destroy()
+
+            def on_enter(event):
+                save_scene()
+
+            scene_entry.bind('<Return>', on_enter)
+
+            btn_frame = ttk.Frame(frame)
+            btn_frame.pack(fill=tk.X, pady=(10, 0))
+            ttk.Button(btn_frame, text="Save", command=save_scene).pack(side=tk.RIGHT, padx=(5, 0))
+            ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    def open_recordings_viewer(self):
+        """Launch the recordings viewer webapp."""
+        viewer_path = os.path.join(SCRIPT_DIR, "recordings_viewer.pyw")
+        if os.path.exists(viewer_path):
+            # Kill existing viewer if running
+            if self.viewer_process and self.viewer_process.poll() is None:
+                self.viewer_process.terminate()
+            self.viewer_process = subprocess.Popen(
+                ["pythonw", viewer_path],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            messagebox.showerror("Error", "recordings_viewer.pyw not found")
+
+    def save_hotkey(self):
+        """Save the selected hotkey to settings."""
+        hotkey = self.hotkey_var.get()
+        self.settings['clip_hotkey'] = hotkey
+        if save_settings(self.settings):
+            self.update_hotkey_status()
+            # Restart hotkey listener with new key
+            self.stop_hotkey_listener()
+            self.start_hotkey_listener()
+            messagebox.showinfo("Hotkey", f"Clip marker hotkey set to {hotkey}")
+        else:
+            messagebox.showerror("Error", "Failed to save hotkey setting")
+
+    def save_notification_setting(self):
+        """Save the notification preference."""
+        self.settings['show_marker_notification'] = self.show_marker_notification_var.get()
+        self.settings['play_marker_sound'] = self.play_marker_sound_var.get()
+        save_settings(self.settings)
+
+    def update_hotkey_status(self):
+        """Update the hotkey status label."""
+        hotkey = self.settings.get('clip_hotkey', 'F9')
+        if self.hotkey_listener_running:
+            self.hotkey_status_label.config(
+                text=f"Listening for {hotkey} (active while watcher is running)",
+                foreground='green'
+            )
+        else:
+            self.hotkey_status_label.config(
+                text=f"Hotkey: {hotkey} (will activate when watcher starts)",
+                foreground='gray'
+            )
+
+    def start_hotkey_listener(self):
+        """Start the global hotkey listener in a background thread."""
+        if self.hotkey_listener_running:
+            return
+
+        hotkey = self.settings.get('clip_hotkey', 'F9')
+        vk_code = VK_CODES.get(hotkey)
+        if not vk_code:
+            return
+
+        self.hotkey_listener_running = True
+
+        def listener_thread():
+            # Use GetAsyncKeyState for simple polling
+            GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+            key_was_pressed = False
+
+            while self.hotkey_listener_running:
+                # Check if key is pressed (high bit set means currently pressed)
+                state = GetAsyncKeyState(vk_code)
+                key_pressed = (state & 0x8000) != 0
+
+                if key_pressed and not key_was_pressed:
+                    # Key just pressed - check if we're recording
+                    watcher_state = get_watcher_state()
+                    if watcher_state and watcher_state.startswith("RECORDING"):
+                        parts = watcher_state.split("|")
+                        game_name = parts[1] if len(parts) > 1 else "Unknown"
+                        add_clip_marker(game_name)
+                        
+                        # Play sound if enabled
+                        if self.settings.get('play_marker_sound', True):
+                            try:
+                                # Play a subtle beep sound (async so it doesn't block)
+                                winsound.MessageBeep(winsound.MB_OK)
+                            except:
+                                pass
+                        
+                        # Show brief notification if enabled (thread-safe)
+                        if self.settings.get('show_marker_notification', True):
+                            self.root.after(0, lambda g=game_name: self.show_marker_toast(g))
+
+                key_was_pressed = key_pressed
+                time.sleep(0.05)  # 50ms polling interval
+
+        self.hotkey_thread = threading.Thread(target=listener_thread, daemon=True)
+        self.hotkey_thread.start()
+        self.root.after(100, self.update_hotkey_status)
+
+    def stop_hotkey_listener(self):
+        """Stop the hotkey listener."""
+        self.hotkey_listener_running = False
+        self.root.after(100, self.update_hotkey_status)
+
+    def show_marker_toast(self, game_name):
+        """Show a brief toast notification that a marker was added."""
+        # Create a temporary toplevel window as toast
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        
+        # Position at bottom-right of screen
+        screen_width = toast.winfo_screenwidth()
+        screen_height = toast.winfo_screenheight()
+        toast.geometry(f"+{screen_width - 300}+{screen_height - 100}")
+
+        frame = ttk.Frame(toast, padding=10)
+        frame.pack()
+        ttk.Label(frame, text=f"✓ Clip marker added for {game_name}",
+                 font=('Segoe UI', 10, 'bold')).pack()
+
+        # Update to ensure window is created
+        toast.update_idletasks()
+        
+        # Use Windows API to set the window as topmost and prevent focus stealing
+        hwnd = ctypes.windll.user32.FindWindowW(None, toast.winfo_toplevel().title() if toast.winfo_toplevel().title() else None)
+        if not hwnd:
+            # Try getting hwnd from the window
+            hwnd = toast.winfo_id()
+        
+        # HWND_TOPMOST = -1, SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040
+        HWND_TOPMOST = -1
+        SWP_NOACTIVATE = 0x0010
+        SWP_SHOWWINDOW = 0x0040
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | 0x0001 | 0x0002  # SWP_NOMOVE | SWP_NOSIZE
+        )
+        
+        # Make it semi-transparent and disable interaction
+        toast.attributes('-alpha', 0.9)
+        toast.attributes('-disabled', True)
+
+        # Auto-close after 1.5 seconds
+        toast.after(1500, toast.destroy)
+
+    def on_close(self):
+        """Clean up subprocesses when closing the manager."""
+        # Stop hotkey listener
+        self.stop_hotkey_listener()
+        # Terminate recordings viewer if running
+        if self.viewer_process and self.viewer_process.poll() is None:
+            self.viewer_process.terminate()
+        self.root.destroy()
 
     def auto_refresh(self):
         self.refresh_status()

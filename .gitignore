@@ -1,8 +1,28 @@
-/.claude
-/CLAUDE.md
-/games_config.json
-/game_state
-/icons
+# Runtime files (created by the application)
+/runtime/*
+!/runtime/.gitkeep
+
+# Build output (frontend)
+/static/
+
+# Python cache
+/__pycache__/
+
+# User configuration (may contain personal paths)
 /manager_settings.json
-/watcher.log
-/__pycache__
+/games_config.json
+
+# Claude Code
+/.claude
+
+# Project documentation (created by Claude)
+/CLAUDE.md
+
+# Game icons (user-specific)
+/icons/
+
+# Windows artifacts
+nul
+
+# Node modules (frontend has its own .gitignore)
+/frontend/node_modules/

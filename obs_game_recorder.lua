@@ -13,16 +13,17 @@ local check_interval = 50  -- ms
 local last_state = ""
 local is_recording = false
 local current_game = ""
+local previous_scene = ""  -- Track previous scene to restore after recording
 
 -- Get default path (same folder as this script, or user profile)
 function get_default_state_path()
     -- Try UserProfile location first (most reliable)
     local user_profile = os.getenv("USERPROFILE")
     if user_profile then
-        -- Check common locations
+        -- Check common locations (runtime subfolder for temp files)
         local paths = {
-            user_profile .. "\\Downloads\\OBSGameLauncher\\game_state",
-            user_profile .. "\\.config\\OBSGameLauncher\\game_state",
+            user_profile .. "\\Downloads\\OBSGameLauncher\\runtime\\game_state",
+            user_profile .. "\\.config\\OBSGameLauncher\\runtime\\game_state",
         }
         for _, path in ipairs(paths) do
             local f = io.open(path, "r")
@@ -74,6 +75,41 @@ function split(str, delim)
     return result
 end
 
+-- Get current scene name
+function get_current_scene_name()
+    local scene = obs.obs_frontend_get_current_scene()
+    if scene then
+        local name = obs.obs_source_get_name(scene)
+        obs.obs_source_release(scene)
+        return name
+    end
+    return nil
+end
+
+-- Switch to a scene by name
+function switch_to_scene(scene_name)
+    if scene_name == nil or scene_name == "" then
+        return false
+    end
+
+    local scenes = obs.obs_frontend_get_scenes()
+    if scenes then
+        for _, scene in ipairs(scenes) do
+            local name = obs.obs_source_get_name(scene)
+            if name == scene_name then
+                obs.obs_frontend_set_current_scene(scene)
+                obs.script_log(obs.LOG_INFO, "Switched to scene: " .. scene_name)
+                obs.source_list_release(scenes)
+                return true
+            end
+        end
+        obs.source_list_release(scenes)
+    end
+
+    obs.script_log(obs.LOG_WARNING, "Scene not found: " .. scene_name)
+    return false
+end
+
 -- Main loop - called every check_interval ms
 function check_state()
     local state = read_state_file()
@@ -87,12 +123,23 @@ function check_state()
     local parts = split(state, "|")
     local status = parts[1]
     local game_name = parts[2] or ""
+    local scene_name = parts[3] or ""
 
     local recording_active = obs.obs_frontend_recording_active()
 
     if status == "RECORDING" and not recording_active and not is_recording then
         -- Start recording
         obs.script_log(obs.LOG_INFO, "Game detected: " .. game_name .. " - Starting recording")
+
+        -- Switch scene if specified
+        if scene_name ~= "" then
+            previous_scene = get_current_scene_name()
+            if previous_scene then
+                obs.script_log(obs.LOG_INFO, "Saving previous scene: " .. previous_scene)
+            end
+            switch_to_scene(scene_name)
+        end
+
         obs.obs_frontend_recording_start()
         is_recording = true
         current_game = game_name
@@ -103,6 +150,13 @@ function check_state()
         obs.obs_frontend_recording_stop()
         is_recording = false
         current_game = ""
+
+        -- Restore previous scene if we switched
+        if previous_scene ~= "" then
+            obs.script_log(obs.LOG_INFO, "Restoring previous scene: " .. previous_scene)
+            switch_to_scene(previous_scene)
+            previous_scene = ""
+        end
 
     elseif status == "STOPPED" then
         -- Watcher stopped
@@ -117,12 +171,13 @@ function script_description()
     return [[
 <h2>Game Auto-Recorder</h2>
 <p>Automatically records when games are running.</p>
+<p>Supports automatic scene switching per game.</p>
 <hr>
 <p><b>Setup:</b></p>
 <ol>
 <li>Set the correct path to <code>game_state</code> file below</li>
 <li>Run <code>game_watcher.pyw</code> in the background</li>
-<li>Use the Game Manager to add games</li>
+<li>Use the Game Manager to add games and assign scenes</li>
 </ol>
 <p><small>Uses file-based communication - minimal CPU impact.</small></p>
 ]]

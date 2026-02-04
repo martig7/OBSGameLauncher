@@ -19,11 +19,15 @@ from configparser import ConfigParser
 
 # Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.join(SCRIPT_DIR, "runtime")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "games_config.json")
-STATE_FILE = os.path.join(SCRIPT_DIR, "game_state")
-PID_FILE = os.path.join(SCRIPT_DIR, "watcher.pid")
+STATE_FILE = os.path.join(RUNTIME_DIR, "game_state")
+PID_FILE = os.path.join(RUNTIME_DIR, "watcher.pid")
 SETTINGS_FILE = os.path.join(SCRIPT_DIR, "manager_settings.json")
-LOG_FILE = os.path.join(SCRIPT_DIR, "watcher.log")
+LOG_FILE = os.path.join(RUNTIME_DIR, "watcher.log")
+
+# Ensure runtime directory exists
+os.makedirs(RUNTIME_DIR, exist_ok=True)
 
 # Check interval in seconds
 CHECK_INTERVAL = 1.0
@@ -297,7 +301,7 @@ def get_process_list():
 
 
 def find_running_game(config):
-    """Check if any enabled game is running. Returns game name or None."""
+    """Check if any enabled game is running. Returns (game_name, scene) or (None, None)."""
     windows = get_visible_windows()
     processes = get_process_list()
 
@@ -312,14 +316,14 @@ def find_running_game(config):
         for win in windows:
             # Check window title
             if selector in win['title'].lower():
-                return game['name']
+                return game['name'], game.get('scene', '')
 
             # Check process name
             proc_name = processes.get(win['pid'], '')
             if selector in proc_name:
-                return game['name']
+                return game['name'], game.get('scene', '')
 
-    return None
+    return None, None
 
 
 def write_state(state):
@@ -436,11 +440,11 @@ def main():
                 pass
 
             # Find running game
-            game_name = find_running_game(config)
+            game_name, game_scene = find_running_game(config)
 
-            # Build state string: RECORDING|game_name or IDLE
+            # Build state string: RECORDING|game_name|scene or IDLE
             if game_name:
-                state = f"RECORDING|{game_name}"
+                state = f"RECORDING|{game_name}|{game_scene}"
             else:
                 state = "IDLE"
 
