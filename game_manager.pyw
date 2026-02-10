@@ -433,6 +433,46 @@ class GameManagerApp:
         ttk.Label(hotkey_frame, text="Markers will appear as pins on the video timeline in the recordings viewer",
                  font=('Segoe UI', 8), foreground='gray').pack(anchor=tk.W, pady=(2, 0))
 
+        # === Auto-Clip Settings ===
+        autoclip_frame = ttk.LabelFrame(tab, text="Automatic Clip Creation", padding=10)
+        autoclip_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(autoclip_frame, text="Automatically create clips from markers when a recording ends:").pack(anchor=tk.W)
+
+        auto_clip_settings = self.settings.get('auto_clip_settings', {})
+        self.auto_clip_enabled_var = tk.BooleanVar(value=auto_clip_settings.get('enabled', True))
+        ttk.Checkbutton(autoclip_frame, text="Enable automatic clip creation from markers",
+                       variable=self.auto_clip_enabled_var).pack(anchor=tk.W, pady=(5, 5))
+
+        buffer_frame = ttk.Frame(autoclip_frame)
+        buffer_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(buffer_frame, text="Seconds before marker:", width=22).pack(side=tk.LEFT)
+        self.buffer_before_var = tk.StringVar(value=str(auto_clip_settings.get('buffer_before_seconds', 30)))
+        ttk.Entry(buffer_frame, textvariable=self.buffer_before_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(buffer_frame, text="s", font=('Segoe UI', 8)).pack(side=tk.LEFT, padx=(2, 0))
+
+        buffer_after_frame = ttk.Frame(autoclip_frame)
+        buffer_after_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(buffer_after_frame, text="Seconds after marker:", width=22).pack(side=tk.LEFT)
+        self.buffer_after_var = tk.StringVar(value=str(auto_clip_settings.get('buffer_after_seconds', 30)))
+        ttk.Entry(buffer_after_frame, textvariable=self.buffer_after_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(buffer_after_frame, text="s", font=('Segoe UI', 8)).pack(side=tk.LEFT, padx=(2, 0))
+
+        self.remove_markers_var = tk.BooleanVar(value=auto_clip_settings.get('remove_processed_markers', True))
+        ttk.Checkbutton(autoclip_frame, text="Remove markers from list after clips are created",
+                       variable=self.remove_markers_var).pack(anchor=tk.W, pady=(0, 5))
+
+        self.delete_recording_var = tk.BooleanVar(value=auto_clip_settings.get('delete_recording_after_clips', False))
+        ttk.Checkbutton(autoclip_frame, text="Delete full recording after clips are saved (keep only clips)",
+                       variable=self.delete_recording_var).pack(anchor=tk.W, pady=(0, 5))
+
+        ttk.Button(autoclip_frame, text="Save Auto-Clip Settings",
+                   command=self.save_auto_clip_settings).pack(anchor=tk.W, pady=(5, 0))
+
+        ttk.Label(autoclip_frame,
+                 text="Clips are saved to the Clips subfolder of your organized recordings path",
+                 font=('Segoe UI', 8), foreground='gray').pack(anchor=tk.W, pady=(2, 0))
+
         # === Info ===
         info_frame = ttk.LabelFrame(tab, text="How It Works", padding=10)
         info_frame.pack(fill=tk.X)
@@ -728,6 +768,41 @@ Example:
             messagebox.showinfo("Hotkey", f"Clip marker hotkey set to {hotkey}")
         else:
             messagebox.showerror("Error", "Failed to save hotkey setting")
+
+    def save_auto_clip_settings(self):
+        """Save auto-clip settings."""
+        try:
+            buffer_before = int(self.buffer_before_var.get())
+            buffer_after = int(self.buffer_after_var.get())
+
+            if buffer_before < 0 or buffer_after < 0:
+                messagebox.showwarning("Warning", "Buffer values must be non-negative")
+                return
+
+            if buffer_before == 0 and buffer_after == 0:
+                messagebox.showwarning("Warning", "Both buffer values are 0. Clips would have zero duration.")
+                return
+        except ValueError:
+            messagebox.showwarning("Warning", "Buffer values must be whole numbers")
+            return
+
+        self.settings['auto_clip_settings'] = {
+            'enabled': self.auto_clip_enabled_var.get(),
+            'buffer_before_seconds': buffer_before,
+            'buffer_after_seconds': buffer_after,
+            'remove_processed_markers': self.remove_markers_var.get(),
+            'delete_recording_after_clips': self.delete_recording_var.get()
+        }
+
+        if save_settings(self.settings):
+            messagebox.showinfo("Auto-Clip Settings",
+                f"Settings saved!\n\n"
+                f"Auto-clip: {'Enabled' if self.auto_clip_enabled_var.get() else 'Disabled'}\n"
+                f"Buffer: {buffer_before}s before, {buffer_after}s after\n"
+                f"Remove markers: {'Yes' if self.remove_markers_var.get() else 'No'}\n"
+                f"Delete recording: {'Yes' if self.delete_recording_var.get() else 'No'}")
+        else:
+            messagebox.showerror("Error", "Failed to save settings")
 
     def save_notification_setting(self):
         """Save the notification preference."""

@@ -3,7 +3,7 @@ Recordings Viewer - Local Web Application
 Flask server that provides a modern web interface for viewing game recordings and clips.
 """
 
-from flask import Flask, send_from_directory, jsonify, request, Response, send_file
+from flask import Flask, send_from_directory, jsonify, request, Response
 import os
 import json
 import re
@@ -422,13 +422,12 @@ def stream_video():
 
     _, ext = os.path.splitext(path)
     mime_type = MIME_TYPES.get(ext.lower(), 'video/mp4')
+    serve_path = path
 
-    # Handle range requests for video seeking
-    file_size = os.path.getsize(path)
+    file_size = os.path.getsize(serve_path)
     range_header = request.headers.get('Range')
 
     if range_header:
-        # Parse range header
         byte_start = 0
         byte_end = file_size - 1
 
@@ -441,7 +440,7 @@ def stream_video():
         content_length = byte_end - byte_start + 1
 
         def generate():
-            with open(path, 'rb') as f:
+            with open(serve_path, 'rb') as f:
                 f.seek(byte_start)
                 remaining = content_length
                 chunk_size = 1024 * 1024  # 1MB chunks
@@ -463,8 +462,25 @@ def stream_video():
         response.headers['Content-Length'] = content_length
         return response
 
-    # No range request - serve full file
-    return send_file(path, mimetype=mime_type)
+    # No range request - stream with Accept-Ranges header
+    def generate_full():
+        with open(serve_path, 'rb') as f:
+            chunk_size = 1024 * 1024  # 1MB chunks
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
+    response = Response(
+        generate_full(),
+        status=200,
+        mimetype=mime_type,
+        direct_passthrough=True
+    )
+    response.headers['Accept-Ranges'] = 'bytes'
+    response.headers['Content-Length'] = file_size
+    return response
 
 
 @app.route('/api/clips/create', methods=['POST'])

@@ -14,6 +14,7 @@ import sys
 import time
 import shutil
 import re
+import subprocess
 from datetime import datetime, timedelta
 from configparser import ConfigParser
 
@@ -225,6 +226,47 @@ def count_sessions_for_date(organized_path, game_name, date):
     return count
 
 
+def remux_to_mp4(source_file):
+    """Remux a video file to MP4 (stream copy, no re-encoding).
+
+    Returns the new MP4 path on success, or the original path if remux fails or isn't needed.
+    """
+    _, ext = os.path.splitext(source_file)
+    if ext.lower() == '.mp4':
+        return source_file
+
+    mp4_path = os.path.splitext(source_file)[0] + '.mp4'
+    log(f"  Remuxing to MP4: {os.path.basename(source_file)} -> {os.path.basename(mp4_path)}")
+
+    try:
+        cmd = [
+            'ffmpeg', '-y', '-i', source_file,
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            mp4_path
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        if result.returncode == 0 and os.path.exists(mp4_path):
+            # Remove original file
+            os.remove(source_file)
+            log(f"  Remux complete, original removed")
+            return mp4_path
+        else:
+            log(f"  Remux failed (exit code {result.returncode}): {result.stderr[:200] if result.stderr else 'no output'}")
+            # Clean up failed output
+            if os.path.exists(mp4_path):
+                os.remove(mp4_path)
+    except Exception as e:
+        log(f"  Remux error: {e}")
+
+    return source_file
+
+
 def organize_recording(source_file, game_name, organized_path):
     """Move and rename a recording file."""
     if not os.path.exists(source_file):
@@ -253,6 +295,221 @@ def organize_recording(source_file, game_name, organized_path):
         return True, dest_path
     except Exception as e:
         return False, str(e)
+
+
+def get_video_duration(file_path):
+    """Get video duration in seconds using ffprobe."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            file_path
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except:
+        pass
+    return None
+
+
+def count_clips_for_date(clips_path, game_name, date_str):
+    """Count existing clips for a game on a specific date to determine next clip number."""
+    pattern = f"{game_name} Clip {date_str} #"
+    count = 0
+    if os.path.exists(clips_path):
+        for filename in os.listdir(clips_path):
+            if filename.startswith(pattern):
+                match = re.search(r'#(\d+)', filename)
+                if match:
+                    num = int(match.group(1))
+                    count = max(count, num)
+    return count
+
+
+def load_clip_markers():
+    """Load clip markers from runtime file."""
+    markers_file = os.path.join(RUNTIME_DIR, "clip_markers.json")
+    try:
+        if os.path.exists(markers_file):
+            with open(markers_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {"markers": []}
+
+
+def save_clip_markers(markers_data):
+    """Save clip markers to runtime file."""
+    markers_file = os.path.join(RUNTIME_DIR, "clip_markers.json")
+    try:
+        with open(markers_file, 'w', encoding='utf-8') as f:
+            json.dump(markers_data, f, indent=2)
+        return True
+    except:
+        return False
+
+
+def create_auto_clips(recording_path, game_name, recording_start_time, recording_end_time, settings):
+    """Create clips from markers that fall within this recording session.
+
+    Args:
+        recording_path: Path to the organized recording file
+        game_name: Name of the game that was recorded
+        recording_start_time: Unix timestamp when recording started
+        recording_end_time: Unix timestamp when recording ended
+        settings: Current manager settings dict
+
+    Returns:
+        List of created clip paths
+    """
+    auto_clip_settings = settings.get('auto_clip_settings', {})
+
+    if not auto_clip_settings.get('enabled', True):
+        log("Auto-clip is disabled, skipping")
+        return []
+
+    buffer_before = auto_clip_settings.get('buffer_before_seconds', 30)
+    buffer_after = auto_clip_settings.get('buffer_after_seconds', 30)
+    remove_processed = auto_clip_settings.get('remove_processed_markers', True)
+
+    # Load markers
+    markers_data = load_clip_markers()
+    all_markers = markers_data.get("markers", [])
+
+    if not all_markers:
+        log("No clip markers found")
+        return []
+
+    # Filter markers belonging to this recording session
+    session_markers = []
+    other_markers = []
+
+    for marker in all_markers:
+        marker_time = marker.get("timestamp", 0)
+        marker_game = marker.get("game_name", "")
+
+        if (marker_game == game_name and
+                recording_start_time <= marker_time <= recording_end_time):
+            session_markers.append(marker)
+        else:
+            other_markers.append(marker)
+
+    if not session_markers:
+        log(f"No clip markers found for this recording session ({game_name})")
+        return []
+
+    log(f"Found {len(session_markers)} clip marker(s) for this session")
+
+    # Get video duration for clamping
+    duration = get_video_duration(recording_path)
+    if duration is None:
+        log("WARNING: Could not determine video duration via ffprobe, skipping auto-clips")
+        return []
+
+    log(f"Recording duration: {duration:.1f}s")
+
+    # Calculate clip regions
+    regions = []
+    for marker in session_markers:
+        marker_time = marker["timestamp"]
+        position_in_video = marker_time - recording_start_time
+
+        clip_start = max(0, position_in_video - buffer_before)
+        clip_end = min(duration, position_in_video + buffer_after)
+
+        if clip_start < clip_end:
+            regions.append((clip_start, clip_end))
+            log(f"  Marker at {position_in_video:.1f}s -> clip region [{clip_start:.1f}s, {clip_end:.1f}s]")
+
+    if not regions:
+        log("No valid clip regions after clamping")
+        return []
+
+    # Sort and merge overlapping regions
+    regions.sort(key=lambda r: r[0])
+    merged = [regions[0]]
+    for start, end in regions[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+
+    log(f"Merged into {len(merged)} clip region(s) from {len(regions)} original region(s)")
+
+    # Determine clips output path
+    organized_path = settings.get('organized_path', '')
+    if not organized_path:
+        log("No organized_path set, cannot create clips")
+        return []
+
+    clips_path = os.path.join(organized_path, "Clips")
+    os.makedirs(clips_path, exist_ok=True)
+
+    # Create each clip using FFmpeg stream-copy
+    created_clips = []
+    date_str = datetime.now().strftime("%Y-%m-%d")
+
+    for clip_start, clip_end in merged:
+        clip_duration = clip_end - clip_start
+        clip_num = count_clips_for_date(clips_path, game_name, date_str) + 1
+        output_filename = f"{game_name} Clip {date_str} #{clip_num}.mp4"
+        output_path = os.path.join(clips_path, output_filename)
+
+        log(f"  Creating clip: {output_filename} ({clip_start:.1f}s to {clip_end:.1f}s, {clip_duration:.1f}s)")
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(clip_start),
+            '-i', recording_path,
+            '-t', str(clip_duration),
+            '-c', 'copy',
+            '-avoid_negative_ts', 'make_zero',
+            output_path
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+
+            if result.returncode == 0 and os.path.exists(output_path):
+                log(f"  SUCCESS: Created {output_filename}")
+                created_clips.append(output_path)
+            else:
+                log(f"  FAILED: FFmpeg exited with code {result.returncode}")
+                if result.stderr:
+                    log(f"    stderr: {result.stderr[:300]}")
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+        except FileNotFoundError:
+            log("  FAILED: FFmpeg not found in PATH")
+            break
+        except Exception as e:
+            log(f"  FAILED: {e}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    # Remove processed markers if configured and at least one clip was created
+    if remove_processed and created_clips:
+        markers_data["markers"] = other_markers
+        if save_clip_markers(markers_data):
+            log(f"Removed {len(session_markers)} processed marker(s) from clip_markers.json")
+        else:
+            log("WARNING: Failed to update clip_markers.json")
+
+    log(f"Auto-clip complete: {len(created_clips)}/{len(merged)} clip(s) created")
+    return created_clips
 
 
 def get_visible_windows():
@@ -410,6 +667,7 @@ def main():
 
     # Recording session tracking
     recording_game = None
+    recording_start_time = None
     files_before_recording = {}
 
     log("Watcher ready. Press Ctrl+C to stop.\n")
@@ -456,6 +714,7 @@ def main():
                 # Recording started
                 if state.startswith("RECORDING") and not last_state.startswith("RECORDING"):
                     recording_game = game_name
+                    recording_start_time = time.time()
                     log(f"=== RECORDING SESSION STARTED: {recording_game} ===")
                     # Snapshot current files in OBS folder
                     if obs_recording_path:
@@ -504,13 +763,39 @@ def main():
 
                             if new_files:
                                 log(f"Organizing {len(new_files)} new recording(s)...")
+                                organized_files = []
                                 for new_file in new_files:
+                                    # Remux non-MP4 files for web playback
+                                    new_file = remux_to_mp4(new_file)
                                     log(f"  Moving: {os.path.basename(new_file)}")
                                     success, result = organize_recording(new_file, recording_game, organized_path)
                                     if success:
                                         log(f"  SUCCESS: -> {result}")
+                                        organized_files.append(result)
                                     else:
                                         log(f"  FAILED: {result}")
+
+                                # Auto-clip creation from markers
+                                recording_end_time = time.time()
+                                auto_clip_settings = settings.get('auto_clip_settings', {})
+                                for org_file in organized_files:
+                                    log(f"Checking for auto-clips: {os.path.basename(org_file)}")
+                                    created_clips = create_auto_clips(
+                                        org_file,
+                                        recording_game,
+                                        recording_start_time,
+                                        recording_end_time,
+                                        settings
+                                    )
+
+                                    # Delete full recording if configured and clips were created
+                                    if (created_clips and
+                                            auto_clip_settings.get('delete_recording_after_clips', False)):
+                                        try:
+                                            os.remove(org_file)
+                                            log(f"Deleted full recording (clips-only mode): {os.path.basename(org_file)}")
+                                        except Exception as e:
+                                            log(f"WARNING: Failed to delete recording: {e}")
                             else:
                                 log("No new recordings found!")
                                 log("This could mean:")
@@ -519,6 +804,7 @@ def main():
                                 log("  - OBS recording path detection found wrong folder")
 
                     recording_game = None
+                    recording_start_time = None
                     files_before_recording = {}
                     log("")
 
